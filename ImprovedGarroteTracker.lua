@@ -23,7 +23,6 @@ local DEFAULT_SAVED_VARIABLES = {
 local state = {
     playerGUID = nil,
     improvedGarrotes = {},
-    targetGarrotes = {},
     warnedMissingAuraAPI = false,
 }
 
@@ -55,9 +54,14 @@ end
 
 local function CountTrackedImprovedGarrotes()
     local count = 0
+    local now = GetTime()
 
-    for _ in pairs(state.improvedGarrotes) do
-        count = count + 1
+    for targetGUID, expires in pairs(state.improvedGarrotes) do
+        if expires and expires > now then
+            count = count + 1
+        else
+            state.improvedGarrotes[targetGUID] = nil
+        end
     end
 
     return count
@@ -71,13 +75,40 @@ local function PrintBlockedAction(event, addonName, blockedFunction)
     end
 end
 
+local function GetSpellNameSafe(spellID, fallbackName)
+    if C_Spell and C_Spell.GetSpellName then
+        local spellName = C_Spell.GetSpellName(spellID)
+
+        if spellName then
+            return spellName
+        end
+    end
+
+    return fallbackName
+end
+
+local function TargetHasPlayerGarrote()
+    if C_UnitAuras and C_UnitAuras.GetAuraDataBySpellName then
+        local garroteName = GetSpellNameSafe(GARROTE_SPELL_ID, "Garrote")
+        return C_UnitAuras.GetAuraDataBySpellName("target", garroteName, "HARMFUL|PLAYER") ~= nil
+    end
+
+    if not state.warnedMissingAuraAPI then
+        state.warnedMissingAuraAPI = true
+        Print("warning: no supported aura API is available for target Garrote detection; assuming absent.")
+    end
+
+    return false
+end
+
 local function PlayerHasImprovedGarrote()
     if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
         return C_UnitAuras.GetPlayerAuraBySpellID(IMPROVED_GARROTE_SPELL_ID) ~= nil
     end
 
-    if AuraUtil and AuraUtil.FindAuraBySpellID then
-        return AuraUtil.FindAuraBySpellID(IMPROVED_GARROTE_SPELL_ID, "player", "HELPFUL") ~= nil
+    if C_UnitAuras and C_UnitAuras.GetAuraDataBySpellName then
+        local improvedGarroteName = GetSpellNameSafe(IMPROVED_GARROTE_SPELL_ID, "Improved Garrote")
+        return C_UnitAuras.GetAuraDataBySpellName("player", improvedGarroteName, "HELPFUL|PLAYER") ~= nil
     end
 
     if not state.warnedMissingAuraAPI then
@@ -90,7 +121,22 @@ end
 
 local function TargetIsMarkedImproved()
     local targetGUID = UnitGUID("target")
-    return targetGUID and state.improvedGarrotes[targetGUID] ~= nil
+
+    if not targetGUID then
+        return false
+    end
+
+    local expires = state.improvedGarrotes[targetGUID]
+
+    if expires and expires > GetTime() then
+        return true
+    end
+
+    if expires then
+        state.improvedGarrotes[targetGUID] = nil
+    end
+
+    return false
 end
 
 local function UpdateDisplay()
@@ -107,80 +153,6 @@ local function UpdateDisplay()
     end
 end
 
-local function AuraMatchesPlayerSource(aura)
-    return aura and (aura.sourceUnit == "player" or aura.sourceUnit == "pet" or aura.isFromPlayerOrPlayerPet)
-end
-
-local function MakeAuraSnapshot(aura)
-    if not aura then
-        return nil
-    end
-
-    return {
-        auraInstanceID = aura.auraInstanceID,
-        duration = aura.duration,
-        expirationTime = aura.expirationTime,
-    }
-end
-
-local function AuraSnapshotChanged(previous, current)
-    if not previous or not current then
-        return previous ~= current
-    end
-
-    return previous.auraInstanceID ~= current.auraInstanceID
-        or previous.duration ~= current.duration
-        or previous.expirationTime ~= current.expirationTime
-end
-
-local function FindTargetGarroteAura()
-    local fallbackAura
-
-    if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
-        for index = 1, 255 do
-            local aura = C_UnitAuras.GetAuraDataByIndex("target", index, "HARMFUL")
-
-            if not aura then
-                break
-            end
-
-            if aura.spellId == GARROTE_SPELL_ID then
-                if AuraMatchesPlayerSource(aura) then
-                    return aura
-                end
-
-                fallbackAura = fallbackAura or aura
-            end
-        end
-    end
-
-    if fallbackAura then
-        return fallbackAura
-    end
-
-    if AuraUtil and AuraUtil.FindAuraBySpellID then
-        local name, icon, count, dispelType, duration, expirationTime, sourceUnit, isStealable, nameplateShowPersonal, spellId =
-            AuraUtil.FindAuraBySpellID(GARROTE_SPELL_ID, "target", "HARMFUL")
-
-        if spellId == GARROTE_SPELL_ID and (sourceUnit == nil or sourceUnit == "player") then
-            return {
-                name = name,
-                icon = icon,
-                applications = count,
-                dispelName = dispelType,
-                duration = duration,
-                expirationTime = expirationTime,
-                sourceUnit = sourceUnit,
-                isStealable = isStealable,
-                nameplateShowPersonal = nameplateShowPersonal,
-                spellId = spellId,
-            }
-        end
-    end
-
-    return nil
-end
-
 local function RefreshTargetGarroteState(reason)
     local targetGUID = UnitGUID("target")
 
@@ -189,31 +161,21 @@ local function RefreshTargetGarroteState(reason)
         return
     end
 
-    local garroteAura = FindTargetGarroteAura()
-
-    if not garroteAura then
-        state.targetGarrotes[targetGUID] = nil
+    if not TargetHasPlayerGarrote() then
         state.improvedGarrotes[targetGUID] = nil
-        DebugPrint("Target Garrote missing; cleared " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
+        DebugPrint("Target player Garrote missing; cleared " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
         UpdateDisplay()
         return
     end
 
-    local currentSnapshot = MakeAuraSnapshot(garroteAura)
-    local previousSnapshot = state.targetGarrotes[targetGUID]
-
-    if AuraSnapshotChanged(previousSnapshot, currentSnapshot) then
-        state.targetGarrotes[targetGUID] = currentSnapshot
-
-        if PlayerHasImprovedGarrote() then
-            state.improvedGarrotes[targetGUID] = true
-            DebugPrint("Target Garrote marked improved on " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
-        else
-            state.improvedGarrotes[targetGUID] = nil
-            DebugPrint("Target Garrote marked normal on " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
-        end
+    if PlayerHasImprovedGarrote() then
+        state.improvedGarrotes[targetGUID] = GetTime() + 23.4
+        DebugPrint("Target player Garrote marked improved on " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
+        UpdateDisplay()
+        return
     end
 
+    DebugPrint("Target player Garrote present without current Improved Garrote; preserved existing mark for " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
     UpdateDisplay()
 end
 
@@ -230,17 +192,14 @@ end
 
 local function PrintStatus()
     local targetGUID = UnitGUID("target")
-    local targetSnapshot = targetGUID and state.targetGarrotes[targetGUID] or nil
 
     Print("playerGUID=" .. tostring(state.playerGUID))
     Print("targetGUID=" .. tostring(targetGUID))
-    Print("targetMarkedImproved=" .. tostring(TargetIsMarkedImproved()))
-    Print("targetGarroteExpirationTime=" .. tostring(targetSnapshot and targetSnapshot.expirationTime))
-    Print("targetGarroteDuration=" .. tostring(targetSnapshot and targetSnapshot.duration))
-    Print("targetGarroteAuraInstanceID=" .. tostring(targetSnapshot and targetSnapshot.auraInstanceID))
+    Print("targetHasPlayerGarrote=" .. tostring(TargetHasPlayerGarrote()))
     Print("playerHasImprovedGarrote=" .. tostring(PlayerHasImprovedGarrote()))
+    Print("targetMarkedImproved=" .. tostring(TargetIsMarkedImproved()))
     Print("trackedImprovedGarrotes=" .. tostring(CountTrackedImprovedGarrotes()))
-    Print("trackingMode=target aura only; combat-log tracking disabled for Midnight compatibility; Crimson Tempest spreading is not implemented")
+    Print("trackingMode=target aura presence only; secret aura fields are not read")
 end
 
 local function PrintHelp()

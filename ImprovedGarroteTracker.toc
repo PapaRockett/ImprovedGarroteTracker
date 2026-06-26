@@ -3,5 +3,6 @@
 ## Notes: Passive Improved Garrote tracker with blocked-action diagnostics.
 ## Author: OpenAI
 ## Version: 3.0.0
+## SavedVariables: ImprovedGarroteTrackerDB
 
 ImprovedGarroteTracker.lua

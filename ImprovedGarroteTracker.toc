@@ -1,8 +1,7 @@
 ## Interface: 120000
 ## Title: Improved Garrote Tracker
-## Notes: Passively tracks Garrotes applied during Improved Garrote and shows a safe central indicator.
+## Notes: Passive Improved Garrote tracker with blocked-action diagnostics.
 ## Author: OpenAI
-## Version: 2.0.0
-## SavedVariables: IGTDB
+## Version: 3.0.0
 
 ImprovedGarroteTracker.lua

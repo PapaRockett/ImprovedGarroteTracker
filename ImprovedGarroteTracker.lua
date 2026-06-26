@@ -1,131 +1,353 @@
 -- ImprovedGarroteTracker
--- Retail WoW API review notes:
--- * Retail aura queries should prefer C_UnitAuras aura-data tables over legacy
---   positional UnitAura/UnitDebuff return values. Positional aura returns have
---   changed across client generations and are easy to parse incorrectly.
--- * COMBAT_LOG_EVENT_UNFILTERED no longer passes its payload as event handler
---   varargs; call CombatLogGetCurrentEventInfo() inside the handler and unpack
---   the documented prefix before reading spell fields.
--- * If Blizzard changes aura helper availability again, this addon fails soft:
---   combat-log tracking remains available, and aura scanning simply returns nil.
+-- Passive Retail/Midnight tracker for Garrote applications made during the
+-- Improved Garrote buff/window. This addon intentionally does not create secure
+-- action buttons, call protected action APIs, or modify Blizzard protected UI.
 
 local ADDON_NAME = ...
 local IGT = _G[ADDON_NAME] or {}
 _G[ADDON_NAME] = IGT
 
 local GARROTE_SPELL_ID = 703
-local PLAYER_FILTER = "HARMFUL|PLAYER"
+local IMPROVED_GARROTE_SPELL_ID = 392403
+local CRIMSON_TEMPEST_SPELL_ID = 1247227
 
-local frame = CreateFrame("Frame")
-IGT.frame = frame
-IGT.active = IGT.active or {}
+local DEFAULTS = {
+    debug = false,
+    locked = false,
+    x = 0,
+    y = 120,
+    crimsonWindow = 0.5,
+    nameplates = false,
+}
 
-local function IsPlayerGarroteAura(aura)
-    if not aura or aura.spellId ~= GARROTE_SPELL_ID then
-        return false
+local state = {
+    playerGUID = nil,
+    improvedGarrotes = {},
+    crimsonWindowExpires = 0,
+    nameplateUnits = {},
+    nameplateOverlays = {},
+    inCombat = false,
+}
+
+IGT.state = state
+
+local eventFrame = CreateFrame("Frame")
+IGT.eventFrame = eventFrame
+
+local displayFrame
+local displayText
+
+local function CopyDefaults(target, defaults)
+    target = target or {}
+    for key, value in pairs(defaults) do
+        if target[key] == nil then
+            target[key] = value
+        end
     end
-
-    -- Retail auraData includes isFromPlayerOrPlayerPet for this exact use case.
-    -- Keep sourceUnit as a conservative fallback because some PTR/build-specific
-    -- aura tables have differed while the C_UnitAuras namespace was settling.
-    return aura.isFromPlayerOrPlayerPet or aura.sourceUnit == "player" or aura.sourceUnit == "pet"
+    return target
 end
 
-local function FindPlayerGarrote(unit)
-    if not unit or not UnitExists(unit) or not C_UnitAuras then
-        return nil
+local function Print(message)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff7fff7fIGT:|r " .. tostring(message))
+end
+
+local function DebugPrint(message)
+    if IGTDB and IGTDB.debug then
+        Print(message)
+    end
+end
+
+local function HasImprovedGarroteBuff()
+    if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
+        return C_UnitAuras.GetPlayerAuraBySpellID(IMPROVED_GARROTE_SPELL_ID) ~= nil
     end
 
-    if C_UnitAuras.GetAuraDataBySpellName then
-        local aura = C_UnitAuras.GetAuraDataBySpellName(unit, (C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(GARROTE_SPELL_ID)) or "Garrote", PLAYER_FILTER)
-        if IsPlayerGarroteAura(aura) then
-            return aura
+    if C_UnitAuras and C_UnitAuras.GetAuraDataBySpellName then
+        local spellName = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(IMPROVED_GARROTE_SPELL_ID)
+        if spellName then
+            return C_UnitAuras.GetAuraDataBySpellName("player", spellName, "HELPFUL") ~= nil
         end
     end
 
-    if C_UnitAuras.GetAuraDataByIndex then
-        local index = 1
-        while true do
-            local aura = C_UnitAuras.GetAuraDataByIndex(unit, index, PLAYER_FILTER)
-            if not aura then
-                break
-            end
-            if IsPlayerGarroteAura(aura) then
-                return aura
-            end
-            index = index + 1
-        end
-    end
-
-    return nil
+    return false
 end
 
-local function UpsertAuraFromAuraData(unit)
-    local guid = UnitGUID(unit)
-    if not guid then
+local function IsCrimsonWindowActive()
+    return GetTime() <= (state.crimsonWindowExpires or 0)
+end
+
+local function TargetIsImproved()
+    local guid = UnitGUID("target")
+    return guid, guid and state.improvedGarrotes[guid] or nil
+end
+
+local function UpdateDisplay()
+    if not displayFrame then
         return
     end
 
-    local aura = FindPlayerGarrote(unit)
-    if aura then
-        IGT.active[guid] = {
-            applications = aura.applications or 0,
-            duration = aura.duration or 0,
-            expirationTime = aura.expirationTime or 0,
-            name = aura.name,
-            source = "aura",
-            updated = GetTime(),
-        }
+    local _, info = TargetIsImproved()
+    if info then
+        displayFrame:Show()
     else
-        IGT.active[guid] = nil
+        displayFrame:Hide()
+    end
+end
+
+local function UpdateOneNameplate(unitToken)
+    if not unitToken or not state.nameplateUnits[unitToken] then
+        return
+    end
+
+    local overlay = state.nameplateOverlays[unitToken]
+    if not overlay then
+        return
+    end
+
+    local guid = UnitGUID(unitToken)
+    if guid and state.improvedGarrotes[guid] then
+        overlay:Show()
+    else
+        overlay:Hide()
+    end
+end
+
+local function UpdateNameplates()
+    if not IGTDB or not IGTDB.nameplates then
+        return
+    end
+
+    for unitToken in pairs(state.nameplateUnits) do
+        UpdateOneNameplate(unitToken)
+    end
+end
+
+local function UpdateAllDisplays()
+    UpdateDisplay()
+    UpdateNameplates()
+end
+
+local function MarkGarrote(destGUID, destName, improved, reason)
+    if not destGUID then
+        return
+    end
+
+    if improved then
+        state.improvedGarrotes[destGUID] = {
+            name = destName,
+            markedAt = GetTime(),
+            reason = reason,
+        }
+        DebugPrint("Garrote marked improved: " .. (destName or destGUID) .. " (" .. reason .. ")")
+    else
+        state.improvedGarrotes[destGUID] = nil
+        DebugPrint("Garrote marked normal: " .. (destName or destGUID))
+    end
+
+    UpdateAllDisplays()
+end
+
+local function RemoveGarrote(destGUID, destName)
+    if not destGUID then
+        return
+    end
+
+    if state.improvedGarrotes[destGUID] then
+        state.improvedGarrotes[destGUID] = nil
+        DebugPrint("Garrote removed: " .. (destName or destGUID))
+        UpdateAllDisplays()
     end
 end
 
 local function HandleCombatLog()
     local timestamp, subevent, _, sourceGUID, _, _, _, destGUID, destName, _, _, spellId = CombatLogGetCurrentEventInfo()
-    if sourceGUID ~= UnitGUID("player") or spellId ~= GARROTE_SPELL_ID or not destGUID then
+    if not state.playerGUID then
+        state.playerGUID = UnitGUID("player")
+    end
+
+    if sourceGUID ~= state.playerGUID then
         return
     end
 
-    if subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH" then
-        -- The combat log is authoritative that our Garrote exists, but it does
-        -- not include expiration time. Refresh visible units through C_UnitAuras;
-        -- otherwise keep a conservative record with timestamp-only data.
-        IGT.active[destGUID] = IGT.active[destGUID] or {}
-        IGT.active[destGUID].name = destName
-        IGT.active[destGUID].source = "combatlog"
-        IGT.active[destGUID].updated = timestamp
-
-        if UnitGUID("target") == destGUID then
-            UpsertAuraFromAuraData("target")
+    if spellId == GARROTE_SPELL_ID then
+        if subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH" then
+            local hasBuff = HasImprovedGarroteBuff()
+            local crimson = IsCrimsonWindowActive()
+            MarkGarrote(destGUID, destName, hasBuff or crimson, hasBuff and "Improved Garrote buff" or "Crimson Tempest window")
+        elseif subevent == "SPELL_AURA_REMOVED" then
+            RemoveGarrote(destGUID, destName)
         end
-    elseif subevent == "SPELL_AURA_REMOVED" then
-        IGT.active[destGUID] = nil
+    elseif spellId == CRIMSON_TEMPEST_SPELL_ID and subevent == "SPELL_CAST_SUCCESS" then
+        local hasTrackedImproved = next(state.improvedGarrotes) ~= nil
+        if hasTrackedImproved then
+            state.crimsonWindowExpires = GetTime() + (IGTDB.crimsonWindow or DEFAULTS.crimsonWindow)
+            DebugPrint("Crimson Tempest spread window active for " .. tostring(IGTDB.crimsonWindow or DEFAULTS.crimsonWindow) .. " seconds")
+        end
+    end
+
+    -- timestamp is intentionally unpacked above for correct Retail combat-log
+    -- payload parsing; GetTime() is used for local display windows.
+    local _ = timestamp
+end
+
+local function SavePosition()
+    if not displayFrame or not IGTDB then
+        return
+    end
+
+    local point, _, _, xOfs, yOfs = displayFrame:GetPoint(1)
+    if point then
+        IGTDB.x = xOfs or IGTDB.x
+        IGTDB.y = yOfs or IGTDB.y
+    end
+end
+
+local function SetLocked(locked)
+    IGTDB.locked = locked and true or false
+    displayFrame:SetMovable(not IGTDB.locked)
+    displayFrame:EnableMouse(not IGTDB.locked)
+    if IGTDB.locked then
+        Print("locked")
+    else
+        Print("unlocked; drag the label to move it")
+    end
+end
+
+local function CreateDisplay()
+    displayFrame = CreateFrame("Frame", "ImprovedGarroteTrackerFrame", UIParent)
+    displayFrame:SetSize(180, 28)
+    displayFrame:SetPoint("CENTER", UIParent, "CENTER", IGTDB.x, IGTDB.y)
+    displayFrame:SetFrameStrata("LOW")
+    displayFrame:SetClampedToScreen(true)
+    displayFrame:SetMovable(not IGTDB.locked)
+    displayFrame:EnableMouse(not IGTDB.locked)
+    displayFrame:RegisterForDrag("LeftButton")
+    displayFrame:SetScript("OnDragStart", function(self)
+        if not IGTDB.locked then
+            self:StartMoving()
+        end
+    end)
+    displayFrame:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        SavePosition()
+    end)
+
+    displayText = displayFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    displayText:SetPoint("CENTER")
+    displayText:SetText("Improved Garrote")
+    displayText:SetTextColor(0.7, 1.0, 0.7)
+
+    displayFrame:Hide()
+    IGT.displayFrame = displayFrame
+end
+
+local function CreateNameplateOverlay(unitToken)
+    if not IGTDB.nameplates or not C_NamePlate or not C_NamePlate.GetNamePlateForUnit then
+        return
+    end
+
+    local nameplate = C_NamePlate.GetNamePlateForUnit(unitToken)
+    if not nameplate or state.nameplateOverlays[unitToken] then
+        return
+    end
+
+    local overlay = CreateFrame("Frame", nil, nameplate)
+    overlay:SetSize(28, 18)
+    overlay:SetPoint("TOP", nameplate, "TOP", 0, -8)
+    overlay:SetFrameStrata("MEDIUM")
+
+    local text = overlay:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    text:SetPoint("CENTER")
+    text:SetText("IG")
+    text:SetTextColor(0.7, 1.0, 0.7)
+    overlay.text = text
+    overlay:Hide()
+
+    state.nameplateOverlays[unitToken] = overlay
+    UpdateOneNameplate(unitToken)
+end
+
+local function RemoveNameplateOverlay(unitToken)
+    local overlay = state.nameplateOverlays[unitToken]
+    if overlay then
+        overlay:Hide()
+        overlay:SetParent(nil)
+        state.nameplateOverlays[unitToken] = nil
+    end
+    state.nameplateUnits[unitToken] = nil
+end
+
+local function PrintStatus()
+    local guid, info = TargetIsImproved()
+    Print("target GUID: " .. tostring(guid) .. "; improved: " .. tostring(info ~= nil))
+    if info then
+        Print("marked at: " .. tostring(info.markedAt) .. "; reason: " .. tostring(info.reason))
+    end
+end
+
+local function ResetState()
+    wipe(state.improvedGarrotes)
+    state.crimsonWindowExpires = 0
+    if displayFrame then
+        displayFrame:ClearAllPoints()
+        displayFrame:SetPoint("CENTER", UIParent, "CENTER", DEFAULTS.x, DEFAULTS.y)
+    end
+    IGTDB.x = DEFAULTS.x
+    IGTDB.y = DEFAULTS.y
+    UpdateAllDisplays()
+    Print("reset")
+end
+
+local function HandleSlash(input)
+    local command = string.lower(strtrim(input or ""))
+    if command == "status" or command == "" then
+        PrintStatus()
+    elseif command == "lock" then
+        SetLocked(true)
+    elseif command == "unlock" then
+        SetLocked(false)
+    elseif command == "reset" then
+        ResetState()
+    elseif command == "debug on" then
+        IGTDB.debug = true
+        Print("debug on")
+    elseif command == "debug off" then
+        IGTDB.debug = false
+        Print("debug off")
+    else
+        Print("commands: /igt status, /igt lock, /igt unlock, /igt reset, /igt debug on, /igt debug off")
     end
 end
 
 local function OnEvent(_, event, arg1)
     if event == "PLAYER_LOGIN" then
-        frame:RegisterEvent("PLAYER_TARGET_CHANGED")
-        frame:RegisterEvent("UNIT_AURA")
-        frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-        UpsertAuraFromAuraData("target")
+        IGTDB = CopyDefaults(IGTDB, DEFAULTS)
+        state.playerGUID = UnitGUID("player")
+        CreateDisplay()
+        SlashCmdList.IMPROVEDGARROTETRACKER = HandleSlash
+        SLASH_IMPROVEDGARROTETRACKER1 = "/igt"
+        eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
+        eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+        eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+        eventFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+        eventFrame:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+        eventFrame:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
+        UpdateAllDisplays()
     elseif event == "PLAYER_TARGET_CHANGED" then
-        UpsertAuraFromAuraData("target")
-    elseif event == "UNIT_AURA" then
-        if arg1 == "target" then
-            UpsertAuraFromAuraData("target")
-        end
+        UpdateDisplay()
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        state.inCombat = true
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        state.inCombat = false
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
         HandleCombatLog()
+    elseif event == "NAME_PLATE_UNIT_ADDED" then
+        state.nameplateUnits[arg1] = true
+        CreateNameplateOverlay(arg1)
+    elseif event == "NAME_PLATE_UNIT_REMOVED" then
+        RemoveNameplateOverlay(arg1)
     end
 end
 
-frame:RegisterEvent("PLAYER_LOGIN")
-frame:SetScript("OnEvent", OnEvent)
-
-function IGT.GetTargetGarrote()
-    UpsertAuraFromAuraData("target")
-    local guid = UnitGUID("target")
-    return guid and IGT.active[guid] or nil
-end
+eventFrame:RegisterEvent("PLAYER_LOGIN")
+eventFrame:SetScript("OnEvent", OnEvent)

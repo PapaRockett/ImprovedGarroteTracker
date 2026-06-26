@@ -18,13 +18,7 @@ local CRIMSON_TEMPEST_SPELL_ID = 1247227
 local CRIMSON_TEMPEST_SPREAD_WINDOW_SECONDS = 0.5
 
 local DEFAULT_SAVED_VARIABLES = {
-    locked = true,
     debug = false,
-    scale = 1,
-    point = "CENTER",
-    relativePoint = "CENTER",
-    x = 0,
-    y = 120,
 }
 
 local state = {
@@ -108,33 +102,7 @@ local function TargetIsMarkedImproved()
     return targetGUID and state.improvedGarrotes[targetGUID] ~= nil
 end
 
-local function SaveDisplayPosition()
-    if not displayFrame or not ImprovedGarroteTrackerDB then
-        return
-    end
 
-    local point, _, relativePoint, x, y = displayFrame:GetPoint(1)
-    ImprovedGarroteTrackerDB.point = point or DEFAULT_SAVED_VARIABLES.point
-    ImprovedGarroteTrackerDB.relativePoint = relativePoint or DEFAULT_SAVED_VARIABLES.relativePoint
-    ImprovedGarroteTrackerDB.x = x or DEFAULT_SAVED_VARIABLES.x
-    ImprovedGarroteTrackerDB.y = y or DEFAULT_SAVED_VARIABLES.y
-end
-
-local function ApplyLockState()
-    if not displayFrame or not ImprovedGarroteTrackerDB then
-        return
-    end
-
-    local unlocked = not ImprovedGarroteTrackerDB.locked
-    displayFrame:SetMovable(unlocked)
-    displayFrame:EnableMouse(unlocked)
-
-    if unlocked then
-        displayFrame:RegisterForDrag("LeftButton")
-    else
-        displayFrame:RegisterForDrag()
-    end
-end
 
 local function UpdateDisplay()
     if not displayText then
@@ -214,39 +182,16 @@ local function HandleCombatLogEvent()
     end
 end
 
-local function RestoreDisplayPosition()
-    displayFrame:ClearAllPoints()
-    displayFrame:SetPoint(
-        ImprovedGarroteTrackerDB.point,
-        UIParent,
-        ImprovedGarroteTrackerDB.relativePoint,
-        ImprovedGarroteTrackerDB.x,
-        ImprovedGarroteTrackerDB.y
-    )
-end
 
 local function CreateDisplay()
-    displayFrame = CreateFrame("Frame", "ImprovedGarroteTrackerFrame", UIParent)
+    displayFrame = CreateFrame("Frame", nil, UIParent)
     displayFrame:SetSize(220, 32)
-    displayFrame:SetScale(ImprovedGarroteTrackerDB.scale or 1)
-    RestoreDisplayPosition()
-    displayFrame:SetClampedToScreen(true)
-    displayFrame:SetScript("OnDragStart", function(self)
-        if ImprovedGarroteTrackerDB and not ImprovedGarroteTrackerDB.locked then
-            self:StartMoving()
-        end
-    end)
-    displayFrame:SetScript("OnDragStop", function(self)
-        self:StopMovingOrSizing()
-        SaveDisplayPosition()
-    end)
+    displayFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
 
     displayText = displayFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     displayText:SetPoint("CENTER", displayFrame, "CENTER")
     displayText:SetTextColor(0.7, 1.0, 0.7)
     displayText:SetText("")
-
-    ApplyLockState()
 end
 
 local function PrintStatus()
@@ -259,23 +204,9 @@ local function PrintStatus()
     Print("crimsonTempestSpreadWindowActive=" .. tostring(CrimsonSpreadWindowIsActive()))
 end
 
-local function ResetDisplay()
-    ImprovedGarroteTrackerDB.point = DEFAULT_SAVED_VARIABLES.point
-    ImprovedGarroteTrackerDB.relativePoint = DEFAULT_SAVED_VARIABLES.relativePoint
-    ImprovedGarroteTrackerDB.x = DEFAULT_SAVED_VARIABLES.x
-    ImprovedGarroteTrackerDB.y = DEFAULT_SAVED_VARIABLES.y
-    ImprovedGarroteTrackerDB.scale = DEFAULT_SAVED_VARIABLES.scale
-
-    if displayFrame then
-        displayFrame:SetScale(ImprovedGarroteTrackerDB.scale)
-        RestoreDisplayPosition()
-    end
-
-    Print("display position reset.")
-end
 
 local function PrintHelp()
-    Print("commands: /igt status, /igt debug on, /igt debug off, /igt lock, /igt unlock, /igt reset")
+    Print("commands: /igt status, /igt debug on, /igt debug off")
 end
 
 local function HandleSlashCommand(input)
@@ -289,16 +220,6 @@ local function HandleSlashCommand(input)
     elseif command == "debug" and argument == "off" then
         ImprovedGarroteTrackerDB.debug = false
         Print("debug disabled.")
-    elseif command == "lock" then
-        ImprovedGarroteTrackerDB.locked = true
-        ApplyLockState()
-        Print("display locked.")
-    elseif command == "unlock" then
-        ImprovedGarroteTrackerDB.locked = false
-        ApplyLockState()
-        Print("display unlocked. Drag the Improved Garrote text with the left mouse button.")
-    elseif command == "reset" then
-        ResetDisplay()
     else
         PrintHelp()
     end

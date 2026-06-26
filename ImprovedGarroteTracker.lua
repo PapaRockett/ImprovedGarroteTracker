@@ -6,7 +6,7 @@
 -- * It does not create buttons, secure templates, macros, bindings, or nameplate UI.
 -- * It does not modify, hook, or anchor to Blizzard frames, nameplates, aura buttons,
 --   unit frames, raid frames, or action bars.
--- * It uses one invisible event frame plus one independent text-only display parented
+-- * It uses one invisible event frame plus one independent small movable icon display parented
 --   directly to UIParent.
 -- * Tracking is based on the player's successful Garrote casts plus an estimated
 --   Improved Garrote window. Combat-log tracking is intentionally not used for
@@ -19,12 +19,19 @@ local IMPROVED_GARROTE_SPELL_ID = 392403
 local STEALTH_SPELL_ID = 1784
 local VANISH_SPELL_ID = 1856
 
-local IMPROVED_GARROTE_DURATION = 23.4
+local GARROTE_BASE_DURATION = 18
+local GARROTE_PANDEMIC_EXTENSION = 5.4
+local GARROTE_MAX_DURATION = GARROTE_BASE_DURATION + GARROTE_PANDEMIC_EXTENSION
 local POST_STEALTH_IMPROVED_WINDOW = 6
 local TEST_DISPLAY_DURATION = 3
 
 local DEFAULT_SAVED_VARIABLES = {
     debug = false,
+    locked = true,
+    point = "CENTER",
+    relativePoint = "CENTER",
+    x = 0,
+    y = 120,
 }
 
 local state = {
@@ -37,7 +44,9 @@ local state = {
 
 local eventFrame = CreateFrame("Frame")
 local displayFrame
-local displayText
+local displayTexture
+local updateElapsed = 0
+local testDisplayUntil = 0
 
 local function Print(message)
     DEFAULT_CHAT_FRAME:AddMessage("|cff77ff77IGT:|r " .. tostring(message))
@@ -171,16 +180,14 @@ local function GetTargetMarkRemaining(targetGUID)
 end
 
 local function UpdateDisplay()
-    if not displayText then
+    if not displayFrame then
         return
     end
 
-    -- The display frame remains created and parented only to UIParent. To keep the
-    -- implementation maximally passive, updates only change this addon's text.
-    if TargetIsMarkedImproved() then
-        displayText:SetText("Improved Garrote")
+    if testDisplayUntil > GetTime() or not ImprovedGarroteTrackerDB.locked or TargetIsMarkedImproved() then
+        displayFrame:Show()
     else
-        displayText:SetText("")
+        displayFrame:Hide()
     end
 end
 
@@ -194,7 +201,16 @@ local function MarkCurrentTargetFromGarroteCast()
     end
 
     if PlayerInImprovedGarroteWindow() then
-        state.improvedGarrotes[targetGUID] = GetTime() + IMPROVED_GARROTE_DURATION
+        local now = GetTime()
+        local existingExpires = state.improvedGarrotes[targetGUID]
+        local remaining = 0
+
+        if existingExpires and existingExpires > now then
+            remaining = existingExpires - now
+        end
+
+        local pandemicExtension = math.min(remaining, GARROTE_PANDEMIC_EXTENSION)
+        state.improvedGarrotes[targetGUID] = math.min(now + GARROTE_BASE_DURATION + pandemicExtension, now + GARROTE_MAX_DURATION)
         DebugPrint("Garrote cast succeeded during Improved Garrote window; marked " .. tostring(targetGUID))
     else
         state.improvedGarrotes[targetGUID] = nil
@@ -218,15 +234,46 @@ local function RefreshPlayerStealthWindow()
     end
 end
 
+local function SaveDisplayPosition()
+    local point, _, relativePoint, x, y = displayFrame:GetPoint(1)
+
+    ImprovedGarroteTrackerDB.point = point or "CENTER"
+    ImprovedGarroteTrackerDB.relativePoint = relativePoint or "CENTER"
+    ImprovedGarroteTrackerDB.x = x or 0
+    ImprovedGarroteTrackerDB.y = y or 120
+end
+
+local function ApplyDisplayLockState()
+    if not displayFrame then
+        return
+    end
+
+    displayFrame:SetMovable(not ImprovedGarroteTrackerDB.locked)
+    displayFrame:EnableMouse(not ImprovedGarroteTrackerDB.locked)
+    displayFrame:RegisterForDrag("LeftButton")
+    UpdateDisplay()
+end
+
 local function CreateDisplay()
     displayFrame = CreateFrame("Frame", nil, UIParent)
-    displayFrame:SetSize(220, 32)
-    displayFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
+    displayFrame:SetSize(10, 10)
+    displayFrame:SetPoint(ImprovedGarroteTrackerDB.point, UIParent, ImprovedGarroteTrackerDB.relativePoint, ImprovedGarroteTrackerDB.x, ImprovedGarroteTrackerDB.y)
 
-    displayText = displayFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    displayText:SetPoint("CENTER", displayFrame, "CENTER")
-    displayText:SetTextColor(0.7, 1.0, 0.7)
-    displayText:SetText("")
+    displayTexture = displayFrame:CreateTexture(nil, "OVERLAY")
+    displayTexture:SetAllPoints(displayFrame)
+    displayTexture:SetColorTexture(1, 0.2, 0.7, 1)
+
+    displayFrame:SetClampedToScreen(true)
+    displayFrame:SetScript("OnDragStart", function(frame)
+        if not ImprovedGarroteTrackerDB.locked then
+            frame:StartMoving()
+        end
+    end)
+    displayFrame:SetScript("OnDragStop", function(frame)
+        frame:StopMovingOrSizing()
+        SaveDisplayPosition()
+    end)
+    ApplyDisplayLockState()
 end
 
 local function PrintStatus()
@@ -241,22 +288,25 @@ local function PrintStatus()
     Print("improvedWindowRemaining=" .. string.format("%.1f", improvedWindowRemaining))
     Print("targetMarkedImproved=" .. tostring(TargetIsMarkedImproved()))
     Print("targetMarkRemaining=" .. string.format("%.1f", GetTargetMarkRemaining(targetGUID)))
+    Print("locked=" .. tostring(ImprovedGarroteTrackerDB.locked))
+    Print("displayPosition=" .. tostring(ImprovedGarroteTrackerDB.point) .. "," .. tostring(ImprovedGarroteTrackerDB.relativePoint) .. "," .. string.format("%.1f", ImprovedGarroteTrackerDB.x or 0) .. "," .. string.format("%.1f", ImprovedGarroteTrackerDB.y or 0))
     Print("trackedImprovedGarrotes=" .. tostring(CountTrackedImprovedGarrotes()))
     Print("trackingMode=UNIT_SPELLCAST_SUCCEEDED + estimated timer; no combat log; no secret aura field comparisons")
 end
 
 local function PrintHelp()
-    Print("commands: /igt status, /igt test, /igt debug on, /igt debug off")
+    Print("commands: /igt status, /igt test, /igt lock, /igt unlock, /igt reset, /igt debug on, /igt debug off")
 end
 
 local function RunDisplayTest()
-    if not displayText then
+    if not displayFrame then
         Print("display is not ready yet.")
         return
     end
 
-    displayText:SetText("Improved Garrote")
-    Print("showing test text for " .. tostring(TEST_DISPLAY_DURATION) .. " seconds.")
+    testDisplayUntil = GetTime() + TEST_DISPLAY_DURATION
+    UpdateDisplay()
+    Print("showing test square for " .. tostring(TEST_DISPLAY_DURATION) .. " seconds.")
 
     if C_Timer and C_Timer.After then
         C_Timer.After(TEST_DISPLAY_DURATION, UpdateDisplay)
@@ -270,6 +320,25 @@ local function HandleSlashCommand(input)
         PrintStatus()
     elseif command == "test" then
         RunDisplayTest()
+    elseif command == "lock" then
+        ImprovedGarroteTrackerDB.locked = true
+        ApplyDisplayLockState()
+        Print("display locked.")
+    elseif command == "unlock" then
+        ImprovedGarroteTrackerDB.locked = false
+        ApplyDisplayLockState()
+        Print("display unlocked; drag the pink square with the left mouse button.")
+    elseif command == "reset" then
+        ImprovedGarroteTrackerDB.point = "CENTER"
+        ImprovedGarroteTrackerDB.relativePoint = "CENTER"
+        ImprovedGarroteTrackerDB.x = 0
+        ImprovedGarroteTrackerDB.y = 120
+        if displayFrame then
+            displayFrame:ClearAllPoints()
+            displayFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 120)
+        end
+        UpdateDisplay()
+        Print("display position reset.")
     elseif command == "debug" and argument == "on" then
         ImprovedGarroteTrackerDB.debug = true
         Print("debug enabled.")
@@ -316,3 +385,11 @@ eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 eventFrame:RegisterEvent("UNIT_AURA")
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 eventFrame:SetScript("OnEvent", OnEvent)
+eventFrame:SetScript("OnUpdate", function(_, elapsed)
+    updateElapsed = updateElapsed + elapsed
+
+    if updateElapsed >= 0.2 then
+        updateElapsed = 0
+        UpdateDisplay()
+    end
+end)

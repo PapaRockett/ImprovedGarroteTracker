@@ -8,13 +8,20 @@
 --   unit frames, raid frames, or action bars.
 -- * It uses one invisible event frame plus one independent text-only display parented
 --   directly to UIParent.
--- * Tracking is target-aura based only. Combat-log tracking was intentionally removed
---   for Midnight compatibility; no combat-log events are registered or read.
+-- * Tracking is based on the player's successful Garrote casts plus an estimated
+--   Improved Garrote window. Combat-log tracking is intentionally not used for
+--   Midnight compatibility; no combat-log events are registered or read.
 
 local ADDON_NAME = ...
 
 local GARROTE_SPELL_ID = 703
 local IMPROVED_GARROTE_SPELL_ID = 392403
+local STEALTH_SPELL_ID = 1784
+local VANISH_SPELL_ID = 1856
+
+local IMPROVED_GARROTE_DURATION = 23.4
+local POST_STEALTH_IMPROVED_WINDOW = 6
+local TEST_DISPLAY_DURATION = 3
 
 local DEFAULT_SAVED_VARIABLES = {
     debug = false,
@@ -24,6 +31,8 @@ local state = {
     playerGUID = nil,
     improvedGarrotes = {},
     warnedMissingAuraAPI = false,
+    improvedWindowUntil = 0,
+    hadStealthLikeAura = false,
 }
 
 local eventFrame = CreateFrame("Frame")
@@ -87,36 +96,37 @@ local function GetSpellNameSafe(spellID, fallbackName)
     return fallbackName
 end
 
-local function TargetHasPlayerGarrote()
+local function PlayerHasAuraByName(unit, spellID, fallbackName, filter)
     if C_UnitAuras and C_UnitAuras.GetAuraDataBySpellName then
-        local garroteName = GetSpellNameSafe(GARROTE_SPELL_ID, "Garrote")
-        return C_UnitAuras.GetAuraDataBySpellName("target", garroteName, "HARMFUL|PLAYER") ~= nil
+        local spellName = GetSpellNameSafe(spellID, fallbackName)
+        return C_UnitAuras.GetAuraDataBySpellName(unit, spellName, filter) ~= nil
     end
 
     if not state.warnedMissingAuraAPI then
         state.warnedMissingAuraAPI = true
-        Print("warning: no supported aura API is available for target Garrote detection; assuming absent.")
+        Print("warning: no supported aura-name API is available; assuming aura absent.")
     end
 
     return false
 end
 
-local function PlayerHasImprovedGarrote()
+local function PlayerHasImprovedGarroteAura()
     if C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID then
         return C_UnitAuras.GetPlayerAuraBySpellID(IMPROVED_GARROTE_SPELL_ID) ~= nil
     end
 
-    if C_UnitAuras and C_UnitAuras.GetAuraDataBySpellName then
-        local improvedGarroteName = GetSpellNameSafe(IMPROVED_GARROTE_SPELL_ID, "Improved Garrote")
-        return C_UnitAuras.GetAuraDataBySpellName("player", improvedGarroteName, "HELPFUL|PLAYER") ~= nil
-    end
+    return PlayerHasAuraByName("player", IMPROVED_GARROTE_SPELL_ID, "Improved Garrote", "HELPFUL|PLAYER")
+end
 
-    if not state.warnedMissingAuraAPI then
-        state.warnedMissingAuraAPI = true
-        Print("warning: no supported aura API is available for Improved Garrote detection; assuming inactive.")
-    end
+local function PlayerHasStealthLikeAura()
+    return PlayerHasAuraByName("player", STEALTH_SPELL_ID, "Stealth", "HELPFUL|PLAYER")
+        or PlayerHasAuraByName("player", VANISH_SPELL_ID, "Vanish", "HELPFUL|PLAYER")
+end
 
-    return false
+local function PlayerInImprovedGarroteWindow()
+    return PlayerHasImprovedGarroteAura()
+        or PlayerHasStealthLikeAura()
+        or GetTime() <= state.improvedWindowUntil
 end
 
 local function TargetIsMarkedImproved()
@@ -139,6 +149,27 @@ local function TargetIsMarkedImproved()
     return false
 end
 
+local function GetTargetMarkRemaining(targetGUID)
+    if not targetGUID then
+        return 0
+    end
+
+    local expires = state.improvedGarrotes[targetGUID]
+
+    if not expires then
+        return 0
+    end
+
+    local remaining = expires - GetTime()
+
+    if remaining <= 0 then
+        state.improvedGarrotes[targetGUID] = nil
+        return 0
+    end
+
+    return remaining
+end
+
 local function UpdateDisplay()
     if not displayText then
         return
@@ -153,30 +184,38 @@ local function UpdateDisplay()
     end
 end
 
-local function RefreshTargetGarroteState(reason)
+local function MarkCurrentTargetFromGarroteCast()
     local targetGUID = UnitGUID("target")
 
     if not targetGUID then
+        DebugPrint("Garrote cast succeeded with no target GUID; no mark changed.")
         UpdateDisplay()
         return
     end
 
-    if not TargetHasPlayerGarrote() then
+    if PlayerInImprovedGarroteWindow() then
+        state.improvedGarrotes[targetGUID] = GetTime() + IMPROVED_GARROTE_DURATION
+        DebugPrint("Garrote cast succeeded during Improved Garrote window; marked " .. tostring(targetGUID))
+    else
         state.improvedGarrotes[targetGUID] = nil
-        DebugPrint("Target player Garrote missing; cleared " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
-        UpdateDisplay()
-        return
+        DebugPrint("Normal Garrote cast succeeded; cleared " .. tostring(targetGUID))
     end
 
-    if PlayerHasImprovedGarrote() then
-        state.improvedGarrotes[targetGUID] = GetTime() + 23.4
-        DebugPrint("Target player Garrote marked improved on " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
-        UpdateDisplay()
-        return
-    end
-
-    DebugPrint("Target player Garrote present without current Improved Garrote; preserved existing mark for " .. tostring(targetGUID) .. " (" .. tostring(reason) .. ")")
     UpdateDisplay()
+end
+
+local function RefreshPlayerStealthWindow()
+    local hasStealthLikeAura = PlayerHasStealthLikeAura()
+
+    if hasStealthLikeAura then
+        state.hadStealthLikeAura = true
+        state.improvedWindowUntil = GetTime() + POST_STEALTH_IMPROVED_WINDOW
+        DebugPrint("Stealth/Vanish aura active; refreshed Improved Garrote window.")
+    elseif state.hadStealthLikeAura then
+        state.hadStealthLikeAura = false
+        state.improvedWindowUntil = GetTime() + POST_STEALTH_IMPROVED_WINDOW
+        DebugPrint("Stealth/Vanish aura ended; started post-stealth Improved Garrote window.")
+    end
 end
 
 local function CreateDisplay()
@@ -192,18 +231,36 @@ end
 
 local function PrintStatus()
     local targetGUID = UnitGUID("target")
+    local improvedWindowRemaining = math.max(0, state.improvedWindowUntil - GetTime())
 
     Print("playerGUID=" .. tostring(state.playerGUID))
     Print("targetGUID=" .. tostring(targetGUID))
-    Print("targetHasPlayerGarrote=" .. tostring(TargetHasPlayerGarrote()))
-    Print("playerHasImprovedGarrote=" .. tostring(PlayerHasImprovedGarrote()))
+    Print("playerHasImprovedGarroteAura=" .. tostring(PlayerHasImprovedGarroteAura()))
+    Print("playerHasStealthLikeAura=" .. tostring(PlayerHasStealthLikeAura()))
+    Print("playerInImprovedGarroteWindow=" .. tostring(PlayerInImprovedGarroteWindow()))
+    Print("improvedWindowRemaining=" .. string.format("%.1f", improvedWindowRemaining))
     Print("targetMarkedImproved=" .. tostring(TargetIsMarkedImproved()))
+    Print("targetMarkRemaining=" .. string.format("%.1f", GetTargetMarkRemaining(targetGUID)))
     Print("trackedImprovedGarrotes=" .. tostring(CountTrackedImprovedGarrotes()))
-    Print("trackingMode=target aura presence only; secret aura fields are not read")
+    Print("trackingMode=UNIT_SPELLCAST_SUCCEEDED + estimated timer; no combat log; no secret aura field comparisons")
 end
 
 local function PrintHelp()
-    Print("commands: /igt status, /igt debug on, /igt debug off")
+    Print("commands: /igt status, /igt test, /igt debug on, /igt debug off")
+end
+
+local function RunDisplayTest()
+    if not displayText then
+        Print("display is not ready yet.")
+        return
+    end
+
+    displayText:SetText("Improved Garrote")
+    Print("showing test text for " .. tostring(TEST_DISPLAY_DURATION) .. " seconds.")
+
+    if C_Timer and C_Timer.After then
+        C_Timer.After(TEST_DISPLAY_DURATION, UpdateDisplay)
+    end
 end
 
 local function HandleSlashCommand(input)
@@ -211,6 +268,8 @@ local function HandleSlashCommand(input)
 
     if command == "status" then
         PrintStatus()
+    elseif command == "test" then
+        RunDisplayTest()
     elseif command == "debug" and argument == "on" then
         ImprovedGarroteTrackerDB.debug = true
         Print("debug enabled.")
@@ -222,7 +281,7 @@ local function HandleSlashCommand(input)
     end
 end
 
-local function OnEvent(_, event, arg1, arg2)
+local function OnEvent(_, event, arg1, arg2, arg3)
     if event == "ADDON_ACTION_FORBIDDEN" or event == "ADDON_ACTION_BLOCKED" then
         PrintBlockedAction(event, arg1, arg2)
         return
@@ -232,12 +291,18 @@ local function OnEvent(_, event, arg1, arg2)
         EnsureSavedVariables()
         state.playerGUID = UnitGUID("player")
         CreateDisplay()
-        RefreshTargetGarroteState(event)
+        RefreshPlayerStealthWindow()
+        UpdateDisplay()
         Print("loaded safely. Type /igt status for current tracking state.")
     elseif event == "PLAYER_TARGET_CHANGED" then
-        RefreshTargetGarroteState(event)
-    elseif event == "UNIT_AURA" and arg1 == "target" then
-        RefreshTargetGarroteState(event)
+        UpdateDisplay()
+    elseif event == "UNIT_AURA" and arg1 == "player" then
+        RefreshPlayerStealthWindow()
+        UpdateDisplay()
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" and arg1 == "player" then
+        if arg3 == GARROTE_SPELL_ID then
+            MarkCurrentTargetFromGarroteCast()
+        end
     end
 end
 
@@ -249,4 +314,5 @@ eventFrame:RegisterEvent("ADDON_ACTION_FORBIDDEN")
 eventFrame:RegisterEvent("ADDON_ACTION_BLOCKED")
 eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 eventFrame:RegisterEvent("UNIT_AURA")
+eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 eventFrame:SetScript("OnEvent", OnEvent)

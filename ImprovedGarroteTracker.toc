@@ -1,8 +1,8 @@
 ## Interface: 120000
 ## Title: Improved Garrote Tracker
-## Notes: Tracks your Garrote on the current target using Retail-safe aura and combat log APIs.
+## Notes: Passively tracks Garrotes applied during Improved Garrote and shows a safe central indicator.
 ## Author: OpenAI
-## Version: 1.0.0
-## X-Retail-API-Review: Uses C_UnitAuras aura data tables and CombatLogGetCurrentEventInfo payload parsing.
+## Version: 2.0.0
+## SavedVariables: IGTDB
 
 ImprovedGarroteTracker.lua
